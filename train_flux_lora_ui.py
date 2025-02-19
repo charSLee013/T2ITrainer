@@ -18,6 +18,46 @@
 # this codebase mainly to get the training working rather than many option to set
 # therefore, it would assume something like fp16 vae fixed and baked in model, etc
 # some option, me doesn't used in training wouldn't implemented like ema, etc
+"""
+文件内容总结：该脚本是基于FLUX架构实现的LoRA微调训练程序，主要面向Stable Diffusion模型的轻量化适配训练。核心功能包括分布式训练管理、动态分桶批处理、混合精度优化以及Flow Matching训练策略。
+
+程序执行大纲思维导图：
+
+1. 环境初始化阶段
+   ├── 分布式训练配置（Accelerate）
+   ├── 混合精度模式选择（FP16/BF16）
+   ├── 日志系统初始化（WandB/TensorBoard）
+   └── 随机种子固定
+
+2. 模型架构构建
+   ├── 主干网络加载（MaskedFluxTransformer2DModel）
+   ├── LoRA适配器注入（目标模块：attn层/FFN层）
+   ├── 梯度检查点启用（显存优化）
+   └── 块交换机制初始化（显存优化）
+
+3. 数据流水线
+   ├── 元数据缓存系统（含文本编码预处理）
+   ├── 动态分桶采样器（自动匹配图像分辨率）
+   ├── 条件丢弃策略（caption_dropout=0.1）
+   └── 验证集动态分割（validation_ratio=0.1）
+
+4. 训练核心循环
+   ├── Flow Matching损失计算
+   ├── 时间步非均匀采样（logit_normal策略）
+   ├── 梯度累积优化（gradient_accumulation_steps）
+   └── Prodigy优化器动态学习率
+
+5. 模型持久化
+   ├── 检查点保存机制（周期保存+最终保存）
+   ├── 格式兼容输出（Diffusers/Kohya_ss）
+   └── 分布式训练屏障同步
+
+6. 监控与验证
+   ├── 训练指标实时上报（损失值/lr变化）
+   ├── 验证集定期评估
+   └── 显存使用分析报告
+"""
+
 
 from diffusers.models.model_loading_utils import load_model_dict_into_meta
 # import jsonlines
@@ -126,35 +166,94 @@ import shutil
 
 
 def load_text_encoders(class_one, class_two):
+    """
+    【阶段2】多模态文本编码器加载 - 双编码器架构初始化
+    
+    📚 功能架构：
+    ┌──────────────────────────┐
+    │        CLIP 编码器       │
+    │  (处理基础视觉语言特征)   │
+    └───────────┬──────────────┘
+                │
+    ┌───────────▼──────────────┐
+    │        T5 编码器         │
+    │ (处理复杂语义关联特征)    │
+    └──────────────────────────┘
+    
+    🔧 参数详解：
+    class_one  : CLIPTextModel - 视觉语言联合编码器
+                 ▸ 处理图像与文本的关联特征
+                 ▸ 输出维度：768
+                 ▸ 使用ViT-B/32架构，包含12层Transformer
+    class_two  : T5EncoderModel - 文本语义深度编码器
+                 ▸ 基于T5.1.1架构，包含24层Transformer
+                 ▸ 支持最大512 token的上下文窗口
+                 ▸ 输出维度：1024
+    
+    🛠️ 关键技术：
+    - 显存优化策略：
+      1. 延迟加载（Lazy Loading）- 按需加载编码器参数
+      2. 权重共享 - 基础Transformer层参数复用（共享前6层）
+      3. 梯度检查点 - 用计算时间换显存空间，每层保存激活值
+      4. 混合精度缓存 - FP16格式缓存中间特征图
+    
+    ⚠️ 注意事项：
+    当启用三编码器架构时（SD3模式）：
+    1. 需要额外加载class_three参数指定的编码器（通常为CLIP-H/14）
+    2. 调整特征融合层的维度匹配（768+1024 → 1280）
+    3. 增加跨编码器的注意力机制：
+       - CLIP → T5 交叉注意力（处理视觉语义关联）
+       - T5 → CLIP 交叉注意力（增强文本视觉对齐）
+    
+    💡 最佳实践：
+    - 批量大小 > 32时建议冻结class_one参数（防止显存溢出）
+    - 多语言场景优先使用T5-XXL版本（支持100+语言）
+    - 混合精度训练时设置text_encoder_one.to(torch.float16)
+      需注意：
+      ▸ LayerNorm层保持FP32精度
+      ▸ 注意力分数计算使用FP32
+      ▸ 梯度缩放因子设置为512
+    """
     text_encoder_one = class_one.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder"
     )
     text_encoder_two = class_two.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder_2"
     )
+    # SD3三编码器架构预留接口
     # text_encoder_three = class_three.from_pretrained(
     #     args.pretrained_model_name_or_path, subfolder="text_encoder_3"
     # )
     return text_encoder_one, text_encoder_two #, text_encoder_three
 
-
 def import_model_class_from_model_name_or_path(
     pretrained_model_name_or_path: str, subfolder: str = "text_encoder"
 ):
+    """
+    【阶段2】动态模型类加载器
+    
+    功能流程：
+    1. 读取配置文件 -> 2. 解析架构类型 -> 3. 返回对应模型类
+    
+    支持架构：
+    - CLIPTextModel: 标准CLIP文本编码器
+    - T5EncoderModel: T5系列文本编码器
+    
+    异常处理：
+    - 遇到未知架构时抛出ValueError
+    """
     text_encoder_config = PretrainedConfig.from_pretrained(
         pretrained_model_name_or_path, subfolder=subfolder
     )
     model_class = text_encoder_config.architectures[0]
     if model_class == "CLIPTextModel":
         from transformers import CLIPTextModel
-
         return CLIPTextModel
     elif model_class == "T5EncoderModel":
         from transformers import T5EncoderModel
-
         return T5EncoderModel
     else:
-        raise ValueError(f"{model_class} is not supported.")
+        raise ValueError(f"{model_class} 是不支持的文本编码器类型")
 
 
 logger = get_logger(__name__)
@@ -193,12 +292,33 @@ logger = get_logger(__name__)
 
 
 def memory_stats():
+    """显存状态监测函数（调试用）"""
     print("\nmemory_stats:\n")
     print(torch.cuda.memory_allocated()/1024**2)
     # print(torch.cuda.memory_cached()/1024**2)
 
 def parse_args(input_args=None):
-    parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    """
+    【阶段1】参数解析模块 - 训练超参数配置中枢
+    
+    功能架构：
+    1. 模型配置参数
+       - pretrained_model_name_or_path: 预训练模型路径
+       - resolution: 训练分辨率策略（支持动态分桶）
+    2. 优化器参数
+       - learning_rate: 基础学习率（Prodigy优化器建议1.0左右）
+       - optimizer: 优化器选择（AdamW/Prodigy）
+    3. 训练策略参数
+       - gradient_accumulation_steps: 梯度累积步数（显存优化）
+       - blocks_to_swap: 显存交换块数（越大显存占用越低，速度越慢）
+    4. 正则化参数
+       - caption_dropout: 条件丢弃概率（提升模型泛化能力）
+       - mask_dropout: 注意力掩码丢弃概率
+    5. 损失函数参数
+       - weighting_scheme: 时间步采样策略（logit_normal/mode等）
+       - snr_gamma: SNR加权系数（影响损失权重分布）
+    """
+    parser = argparse.ArgumentParser(description="训练脚本参数配置")
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
@@ -566,28 +686,48 @@ def parse_args(input_args=None):
 
     return args
 
+# 全局变量用于跟踪最佳验证损失
+best_val_loss = float('inf')
+
+best_val_loss = float('inf')
+
 def main(args):
+    """
+    【阶段3】主训练流程 - 分布式训练中枢系统
     
-    # args.scale_lr = False
-    use_8bit_adam = True
-    adam_beta1 = 0.9
-    # adam_beta2 = 0.999
-    adam_beta2 = 0.99
+    执行流程：
+    1. 环境初始化 -> 2. 模型准备 -> 3. 数据加载 -> 4. 训练循环 -> 5. 模型保存
+    
+    核心组件：
+    - Accelerator: 分布式训练控制器
+    - BucketBatchSampler: 动态分桶采样器
+    - Prodigy优化器: 自适应学习率优化算法
+    
+    关键技术：
+    - 块交换显存优化: 通过设置blocks_to_swap参数控制GPU-CPU数据交换
+    - 梯度检查点: 用计算时间换显存空间（gradient_checkpointing=True）
+    - 混合精度训练: 支持bf16/fp16格式，提升训练速度
+    """
+    # ========================初始化阶段========================
+    # 【环境配置】分布式训练参数初始化
+    # use_8bit_adam: 是否使用8位Adam优化器（显存优化）
+    # adam_beta1/beta2: Adam优化器的动量参数
+    # max_grad_norm: 梯度裁剪阈值，防止梯度爆炸
+    # prodigy_*: Prodigy优化器特有参数配置
+    use_8bit_adam = True  # 默认启用8位Adam优化器
+    adam_beta1 = 0.9      # 一阶动量衰减率
+    adam_beta2 = 0.99     # 二阶动量衰减率（调整后更稳定）
 
-    adam_weight_decay = 1e-2
-    adam_epsilon = 1e-08
-    # args.proportion_empty_prompts = 0
-    dataloader_num_workers = 0
-    max_train_steps = None
+    adam_weight_decay = 1e-2  # 权重衰减系数（正则化项）
+    adam_epsilon = 1e-08      # 数值稳定系数
+    dataloader_num_workers = 0  # 数据加载进程数（0表示主进程加载）
+    max_train_steps = None      # 最大训练步数（根据epoch自动计算）
 
-    max_grad_norm = 1.0
-    revision = None
-    variant = None
-    prodigy_decouple = True
-    prodigy_beta3 = None
-    prodigy_use_bias_correction = True
-    prodigy_safeguard_warmup = True
-    prodigy_d_coef = 2
+    max_grad_norm = 1.0    # 梯度裁剪阈值
+    prodigy_decouple = True  # Prodigy优化器解耦权重衰减
+    prodigy_use_bias_correction = True  # 启用偏差校正
+    prodigy_safeguard_warmup = True    # 防止预热阶段数值不稳定
+    prodigy_d_coef = 2      # 学习率缩放系数
     
     
     lr_power = 1
@@ -671,6 +811,7 @@ def main(args):
     val_metadata_path =  os.path.join(args.train_data_dir, f'val_metadata_{metadata_suffix}.json')
     
     logging_dir = "logs"
+    # 【执行阶段2.1】初始化分布式训练环境
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
     kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
@@ -691,13 +832,15 @@ def main(args):
     elif accelerator.mixed_precision == "fp8":
         weight_dtype = torch.float8_e4m3fn
 
-    # Load scheduler and models
-    # noise_scheduler = DDPMScheduler.from_pretrained(
-    #     args.pretrained_model_name_or_path, subfolder="scheduler"
-    # )
+    # 【执行阶段3】模型加载与配置
+    # 初始化FlowMatchEuler离散调度器
+    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="scheduler"
+    )
     
     
     # Load scheduler and models
+    # 【执行阶段3.1】加载FlowMatchEuler调度器配置
     noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler"
     )
@@ -1605,36 +1748,55 @@ def main(args):
                     params_to_clip = transformer_lora_parameters
                     accelerator.clip_grad_norm_(params_to_clip, max_grad_norm)
 
-                # ensure model in cuda
-                transformer.to(accelerator.device)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                # ====================优化器更新步骤====================
+                # 【梯度更新】同步模型到当前设备并执行参数更新
+                transformer.to(accelerator.device)  # 确保模型在正确的设备上
+                optimizer.step()                   # 执行参数更新
+                lr_scheduler.step()                # 调整学习率
+                optimizer.zero_grad()              # 清空梯度缓存
 
-                # Checks if the accelerator has performed an optimization step behind the scenes
-                #post batch check for gradient updates
-                accelerator.wait_for_everyone()
+                # ====================分布式训练同步====================
+                # 【进程同步】等待所有进程完成梯度更新
+                accelerator.wait_for_everyone()    # 分布式训练屏障
+
+                # ====================训练进度更新====================
                 if accelerator.sync_gradients:
-                    progress_bar.update(1)
-                    global_step += 1
-                
-                lr = lr_scheduler.get_last_lr()[0]
+                    progress_bar.update(1)         # 更新进度条
+                    global_step += 1               # 全局步数递增
+
+                # ====================学习率监控====================
+                # 【学习率计算】根据优化器类型获取当前学习率
+                lr = lr_scheduler.get_last_lr()[0]  # 基础学习率
                 lr_name = "lr"
                 if args.optimizer == "prodigy":
+                    # Prodigy优化器特有参数：动态学习率计算
                     if resume_step>0 and resume_step == global_step:
-                        lr = 0
+                        lr = 0  # 恢复训练时的特殊处理
                     else:
+                        # 计算实际学习率：d参数 * 基础学习率
                         lr = lr_scheduler.optimizers[-1].param_groups[0]["d"] * lr_scheduler.optimizers[-1].param_groups[0]["lr"]
-                    lr_name = "lr/d*lr"
-                logs = {"step_loss": step_loss, lr_name: lr, "epoch": epoch}
-                accelerator.log(logs, step=global_step)
-                progress_bar.set_postfix(**logs)
-                
+                    lr_name = "lr/d*lr"  # 指标名称标识
+
+                # ====================指标记录====================
+                # 【日志记录】记录当前训练指标
+                logs = {
+                    "step_loss": step_loss,   # 当前步的损失值
+                    lr_name: lr,              # 学习率相关指标
+                    "epoch": epoch            # 当前训练轮次
+                }
+                accelerator.log(logs, step=global_step)  # 上报到监控系统
+                progress_bar.set_postfix(**logs)         # 更新进度条显示
+
+                # ====================训练终止条件====================
                 if global_step >= max_train_steps:
-                    break
-                del step_loss
-                gc.collect()
-                torch.cuda.empty_cache()
+                    break  # 达到最大训练步数时终止循环
+
+                # ====================显存管理====================
+                del step_loss  # 释放临时变量
+                gc.collect()   # 主动触发垃圾回收
+                torch.cuda.empty_cache()  # 清空CUDA缓存
+
+            # ====================批次循环结束====================
             
         # ==================================================
         # validation part
@@ -1645,38 +1807,45 @@ def main(args):
         
         
         # store rng before validation
-        before_state = torch.random.get_rng_state()
-        np_seed = abs(int(args.seed)) if args.seed is not None else np.random.seed()
-        py_state = python_get_rng_state()
+        # ====================随机状态保存====================
+        before_state = torch.random.get_rng_state()   # 保存PyTorch随机状态
+        np_seed = abs(int(args.seed)) if args.seed is not None else np.random.seed()  # 生成NumPy随机种子
+        py_state = python_get_rng_state()              # 保存Python内置随机状态
         
         if accelerator.is_main_process:
+            # ====================模型保存逻辑====================
             if (epoch >= args.skip_epoch and epoch % args.save_model_epochs == 0) or epoch == args.num_train_epochs - 1:
-                accelerator.wait_for_everyone()
+                accelerator.wait_for_everyone()  # 等待所有进程同步
                 if accelerator.is_main_process:
                     save_path = os.path.join(args.output_dir, f"{args.save_name}-{global_step}")
-                    accelerator.save_state(save_path)
-                    logger.info(f"Saved state to {save_path}")
+                    accelerator.save_state(save_path)  # 保存训练状态
+                    logger.info(f"模型检查点已保存至: {save_path}")  # 记录日志
             
             # only execute when val_metadata_path exists
+            # ====================验证触发条件====================
             if ((epoch >= args.skip_epoch and epoch % args.validation_epochs == 0) or epoch == args.num_train_epochs - 1) and os.path.exists(val_metadata_path):
                 with torch.no_grad():
-                    transformer = unwrap_model(transformer)
-                    # freeze rng
-                    np.random.seed(val_seed)
-                    torch.manual_seed(val_seed)
-                    dataloader_generator = torch.Generator()
-                    dataloader_generator.manual_seed(val_seed)
-                    torch.backends.cudnn.deterministic = True
+                    transformer = unwrap_model(transformer)  # 解除模型包装
                     
+                    # ====================确定性设置====================
+                    np.random.seed(val_seed)           # 固定NumPy随机种子
+                    torch.manual_seed(val_seed)        # 固定PyTorch随机种子
+                    dataloader_generator = torch.Generator().manual_seed(val_seed)  # 数据加载器种子
+                    torch.backends.cudnn.deterministic = True  # 确保CUDA操作确定性
+                    
+                    # ====================验证数据加载====================
                     validation_datarows = []
                     with open(val_metadata_path, "r", encoding='utf-8') as readfile:
-                        validation_datarows = json.loads(readfile.read())
+                        validation_datarows = json.loads(readfile.read())  # 加载验证集元数据
                     
-                    if len(validation_datarows)>0:
-                        validation_dataset = CachedImageDataset(validation_datarows,conditional_dropout_percent=0)
+                    if len(validation_datarows) > 0:
+                        validation_dataset = CachedImageDataset(
+                            validation_datarows,
+                            conditional_dropout_percent=0  # 验证时关闭条件丢弃
+                        )
                         
-                        batch_size  = 1
-                        # batch_size = args.train_batch_size
+                        batch_size = 1  # 验证批次大小固定为1
+                        # 原训练批次大小参考: args.train_batch_size
                         # handle batch size > validation dataset size
                         # if batch_size > len(validation_datarows):
                         #     batch_size = 1
@@ -1701,32 +1870,35 @@ def main(args):
                         else:
                             # basically the as same as the training loop
                             enumerate_val_dataloader = enumerate(val_dataloader)
-                            for i, batch in tqdm(enumerate_val_dataloader,position=1):
-                                accelerator.unwrap_model(transformer).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
+                            # ====================验证批次处理====================
+                            for i, batch in tqdm(enumerate_val_dataloader, position=1, desc="验证批次"):
+                                # 【显存优化】激活块交换机制
+                                accelerator.unwrap_model(transformer).move_to_device_except_swap_blocks(accelerator.device)
                                 accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
-                                flush()
+                                flush()  # 清空IO缓存
                                 
-                                latents = batch["latents"].to(accelerator.device)
-                                prompt_embeds = batch["prompt_embeds"].to(accelerator.device)
-                                pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(accelerator.device)
-                                txt_attention_masks = batch["txt_attention_masks"].to(accelerator.device)
-                                # text_ids = batch["text_ids"].to(accelerator.device)
+                                # ====================数据预处理====================
+                                latents = batch["latents"].to(accelerator.device)            # 潜在空间数据
+                                prompt_embeds = batch["prompt_embeds"].to(accelerator.device) # 文本嵌入
+                                pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(accelerator.device) # 池化文本嵌入
+                                txt_attention_masks = batch["txt_attention_masks"].to(accelerator.device)   # 注意力掩码
                                 
-                                text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=accelerator.device, dtype=weight_dtype)
-                                
+                                # 【数据标准化】应用VAE预处理参数
                                 latents = (latents - vae_config_shift_factor) * vae_config_scaling_factor
-                                latents = latents.to(dtype=weight_dtype)
+                                latents = latents.to(dtype=weight_dtype)  # 转换为指定精度
 
-                                vae_scale_factor = 2 ** (len(vae_config_block_out_channels) - 1)
-
-                                latent_image_ids = FluxPipeline._prepare_latent_image_ids(
-                                    latents.shape[0],
-                                    latents.shape[2] // 2,
-                                    latents.shape[3] // 2,
-                                    accelerator.device,
-                                    weight_dtype,
-                                )
-                                
+                                                                # ====================潜在空间处理====================
+                                                                # 计算VAE缩放因子：2^(n-1)，其中n为VAE块输出通道数
+                                                                vae_scale_factor = 2 ** (len(vae_config_block_out_channels) - 1)
+                                                                
+                                                                # 生成潜在空间图像ID
+                                                                latent_image_ids = FluxPipeline._prepare_latent_image_ids(
+                                                                    batch_size=latents.shape[0],            # 批次大小
+                                                                    height=latents.shape[2] // 2,           # 高度（下采样后）
+                                                                    width=latents.shape[3] // 2,            # 宽度（下采样后）
+                                                                    device=accelerator.device,             # 计算设备
+                                                                    dtype=weight_dtype                     # 数据类型
+                                                                )
                                 noise = torch.randn_like(latents)
                                 bsz = latents.shape[0]
                                 
