@@ -534,7 +534,7 @@ def parse_args(input_args=None):
         default=1e-08,
         help="Epsilon value for the Adam optimizer and Prodigy optimizers. Adam和Prodigy优化器的epsilon值。",
     )
-    // ... existing code ...
+
     parser.add_argument(
         "--prodigy_use_bias_correction",  # Prodigy优化器的偏差校正
         type=bool,
@@ -684,7 +684,7 @@ def parse_args(input_args=None):
         help="SNR weighting gamma to be used if rebalancing the loss. Recommended value is 5.0. "
         "More details here: https://arxiv.org/abs/2303.09556. 如果重新平衡损失，则使用的SNR加权gamma值。推荐值为5.0。更多详情请参见链接。",
     )
-    // ... existing code ...
+
     parser.add_argument(
         "--max_time_steps",  # 最大时间步限制
         type=int,
@@ -1518,6 +1518,7 @@ def main(args):
             betas=(adam_beta1, adam_beta2),  # 动量参数默认(0.9, 0.999)
             weight_decay=adam_weight_decay,  # 权重衰减系数（防过拟合）
             eps=adam_epsilon,  # 数值稳定性常数（默认1e-8）
+        )
 
     # ============== Prodigy优化器实现分支 ==============
     if args.optimizer.lower() == "prodigy":
